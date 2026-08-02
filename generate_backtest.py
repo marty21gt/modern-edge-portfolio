@@ -284,6 +284,49 @@ def stats(curve):
 # RUN
 # ----------------------------------------------------------------------------
 
+SLEEVES = {
+    "VOO": "Equity", "QQQ": "Equity", "VEA": "Equity", "IEMG": "Equity",
+    "SGOV": "Fixed Income", "IEF": "Fixed Income", "SCHP": "Fixed Income",
+    "DBMF": "Alternatives", "SGOL": "Alternatives", "BITB": "Alternatives",
+    "CAOS": "Alternatives", "VXUS": "Benchmark", "BND": "Benchmark",
+}
+
+
+def export_components(px):
+    """Write per-holding post-splice daily prices and returns for review."""
+    cols = [c for c in list(MODERN_EDGE_WEIGHTS) + ["VXUS", "BND"] if c in px]
+    prices = px[cols].dropna(how="all").sort_index()
+    prices_out = prices.copy()
+    prices_out.insert(0, "date", [str(d)[:10] for d in prices.index])
+    prices_out.to_csv("data/modern_edge_components_prices.csv", index=False,
+                      float_format="%.6f")
+    rets = prices.pct_change()
+    rets_out = (rets * 100).round(6)
+    rets_out.insert(0, "date", [str(d)[:10] for d in rets.index])
+    rets_out.to_csv("data/modern_edge_components_returns.csv", index=False)
+    print(f"  components: {len(cols)} series, {len(prices)} rows -> "
+          f"data/modern_edge_components_prices.csv (+ _returns.csv)")
+
+
+def component_meta(splice_log):
+    """Per-holding weight, sleeve, and splice status for the JSON."""
+    spliced = {p["holding"]: p for p in splice_log}
+    out = []
+    for t, w in MODERN_EDGE_WEIGHTS.items():
+        entry = {"ticker": t, "sleeve": SLEEVES.get(t), "weight_pct": round(w * 100, 2)}
+        if t in spliced:
+            entry["splice"] = spliced[t].get("mode") or spliced[t].get("proxy")
+            entry["splice_note"] = spliced[t]["note"]
+        else:
+            entry["splice"] = "none (real data over full window)"
+        out.append(entry)
+    for t, w in BENCHMARK_WEIGHTS.items():
+        out.append({"ticker": t, "sleeve": "Benchmark",
+                    "weight_pct": round(w * 100, 2),
+                    "splice": "cash-scaled proxy where noted" if t in spliced else "none"})
+    return out
+
+
 def run():
     os.makedirs("data", exist_ok=True)   # create output dir if missing
     earliest = min(w["start"] for w in WINDOWS.values())
@@ -294,13 +337,26 @@ def run():
     splice_log = []
     px = prepare(px, splice_log)
 
+    # ---- SOURCE DATA EXPORT (for independent/forensic review) ----
+    # Every per-holding daily series that feeds the portfolio, AFTER proxy
+    # splicing, plus the two benchmark components. This is the raw input to the
+    # JSON: component prices and component daily returns.
+    export_components(px)
+
     result = {"generated_utc": pd.Timestamp.now(tz="UTC").isoformat(),
               "lineup": MODERN_EDGE_WEIGHTS, "benchmark": BENCHMARK_WEIGHTS,
               "advisory_fee_annual_pct": 0.8, "rebalance": "quarterly",
               "caos_mode": CAOS_MODE, "proxies": splice_log,
+              "components": component_meta(splice_log),
               "compliance": ("Any spliced series is HYPOTHETICAL/BACKTESTED under "
                              "SEC Marketing Rule 206(4)-1 and requires hypothetical "
                              "disclosures. Net-of-fee applies to Modern Edge only."),
+              "source_files": {
+                  "component_prices": "data/modern_edge_components_prices.csv",
+                  "component_returns": "data/modern_edge_components_returns.csv",
+                  "note": ("Post-splice daily series for every holding + the two "
+                           "benchmark components. Portfolio = quarterly-rebalanced "
+                           "weighted sum of these; ME net also subtracts 0.2%/qtr.")},
               "windows": {}}
 
     for name, cfg in WINDOWS.items():

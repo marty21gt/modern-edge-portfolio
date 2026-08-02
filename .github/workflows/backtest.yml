@@ -27,7 +27,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install "yfinance>=0.2.40" pandas numpy
+        run: pip install "yfinance>=0.2.40" pandas numpy pandas-datareader
 
       - name: Generate backtest data
         run: python generate_backtest.py

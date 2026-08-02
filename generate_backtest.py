@@ -23,6 +23,7 @@ Marketing Rule 206(4)-1 and needs the standard hypothetical disclosures.
 """
 
 import json
+import os
 import sys
 import numpy as np
 import pandas as pd
@@ -96,14 +97,63 @@ def all_tickers():
 
 
 def download(tickers, start):
-    """Daily adjusted-close (total return). Returns a wide DataFrame."""
+    """Daily adjusted-close (total return). Returns a wide DataFrame.
+
+    Bulk-pulls from Yahoo, then for any ticker Yahoo couldn't return (e.g. the
+    delisted AVOLX mutual fund) tries, in order: a local CSV in data/, then Stooq.
+    """
     raw = yf.download(
         tickers, start=start, auto_adjust=True,
         progress=False, group_by="column", threads=True,
     )
     px = raw["Close"] if "Close" in raw.columns.get_level_values(0) else raw
+    if isinstance(px, pd.Series):
+        px = px.to_frame(tickers[0])
     px = px.dropna(how="all").sort_index()
-    return px
+
+    for t in tickers:
+        if t in px.columns and px[t].dropna().size > 5:
+            continue
+        recovered = _fallback_series(t, start)
+        if recovered is not None and recovered.dropna().size > 5:
+            recovered = recovered[~recovered.index.duplicated(keep="last")]
+            px[t] = recovered.reindex(px.index.union(recovered.index)).reindex(px.index)
+            print(f"  recovered {t} via {recovered.name}")
+        else:
+            print(f"  WARNING: no data for {t} from any source")
+    return px.sort_index()
+
+
+def _fallback_series(ticker, start):
+    """Try a local CSV (data/<ticker>.csv, columns date,close), then Stooq."""
+    # 1) local CSV drop-in — most reliable for a delisted fund like AVOLX
+    for path in (f"data/{ticker}.csv", f"data/{ticker.lower()}.csv"):
+        if os.path.exists(path):
+            try:
+                df = pd.read_csv(path)
+                dcol = next(c for c in df.columns if c.lower() in ("date", "datetime"))
+                ccol = next(c for c in df.columns
+                            if c.lower() in ("close", "adj close", "adjclose", "nav"))
+                s = pd.Series(df[ccol].values,
+                              index=pd.to_datetime(df[dcol]), name=f"local:{path}")
+                return s.sort_index().loc[start:] if start else s.sort_index()
+            except Exception as e:  # noqa
+                print(f"  {ticker} local CSV read failed: {e}")
+    # 2) Stooq (GitHub runner can reach it; this sandbox cannot)
+    try:
+        from pandas_datareader import data as pdr
+        for sym in (ticker, f"{ticker}.US"):
+            try:
+                df = pdr.DataReader(sym, "stooq", start)
+                if df is not None and not df.empty and "Close" in df:
+                    s = df["Close"].sort_index()
+                    s.name = f"stooq:{sym}"
+                    return s
+            except Exception:  # noqa
+                continue
+    except Exception:  # noqa
+        pass
+    return None
 
 
 def splice(px, real, proxy):
@@ -141,19 +191,22 @@ def prepare(px, splice_log):
     # CAOS handling
     if "CAOS" in px:
         real_start = px["CAOS"].first_valid_index()
-        if CAOS_MODE == "cash":
-            filler = "SGOV" if px.get("SGOV") is not None else "BIL"
-            fill = px[filler]
+        avolx_ok = ("AVOLX" in px) and (px["AVOLX"].dropna().size > 5)
+
+        def cash_stub(reason):
+            filler = "SGOV" if "SGOV" in px else "BIL"
+            fill = px[filler].dropna()
             stub = fill[fill.index < real_start]
             if not stub.empty:
                 anchor = px["CAOS"].loc[real_start]
                 stub_scaled = stub / fill.loc[stub.index[-1]] * anchor
                 px["CAOS"] = pd.concat([stub_scaled, px["CAOS"].dropna()]).reindex(px.index)
-                splice_log.append(
-                    {"holding": "CAOS", "proxy": filler, "mode": "cash-stub",
-                     "note": ("CAOS 5% sleeve held in cash proxy before 2023-03 "
-                              "conversion; understates crash hedge pre-2023")})
-        elif CAOS_MODE == "AVOLX":
+            splice_log.append(
+                {"holding": "CAOS", "proxy": filler, "mode": "cash-stub",
+                 "note": ("CAOS 5% sleeve held in cash proxy before 2023-03-06 "
+                          "conversion; understates crash hedge pre-2023. " + reason)})
+
+        if CAOS_MODE == "AVOLX" and avolx_ok:
             px = splice(px, "CAOS", "AVOLX")
             splice_log.append(
                 {"holding": "CAOS", "proxy": "AVOLX", "mode": "predecessor-fund-splice",
@@ -163,6 +216,14 @@ def prepare(px, splice_log):
                           "2013. DISCLOSE: (1) predecessor mutual fund with different "
                           "fee/tax treatment; (2) AVOLX-era payoff was somewhat more "
                           "convex than today's ETF-wrapper CAOS.")})
+        elif CAOS_MODE == "AVOLX" and not avolx_ok:
+            print("  WARNING: AVOLX unavailable from Yahoo/Stooq/CSV — "
+                  "falling back to conservative cash-stub for pre-2023 CAOS. "
+                  "To use the real predecessor history, drop its NAV history into "
+                  "data/AVOLX.csv (columns: date,close) and re-run.")
+            cash_stub("AVOLX could not be retrieved; conservative fallback used.")
+        elif CAOS_MODE == "cash":
+            cash_stub("CAOS_MODE=cash selected.")
         # "start" mode: no fill; window trimmed to CAOS real data below
     return px
 
@@ -224,15 +285,16 @@ def stats(curve):
 # ----------------------------------------------------------------------------
 
 def run():
+    os.makedirs("data", exist_ok=True)   # create output dir if missing
     earliest = min(w["start"] for w in WINDOWS.values())
-    pull_start = "2015-01-01"  # pull extra history so proxies have room
+    pull_start = "2013-01-01"  # pull full predecessor history; windows auto-trim
     print(f"Downloading {len(all_tickers())} tickers from {pull_start} ...")
     px = download(all_tickers(), pull_start)
 
     splice_log = []
     px = prepare(px, splice_log)
 
-    result = {"generated_utc": pd.Timestamp.utcnow().isoformat(),
+    result = {"generated_utc": pd.Timestamp.now(tz="UTC").isoformat(),
               "lineup": MODERN_EDGE_WEIGHTS, "benchmark": BENCHMARK_WEIGHTS,
               "advisory_fee_annual_pct": 0.8, "rebalance": "quarterly",
               "caos_mode": CAOS_MODE, "proxies": splice_log,

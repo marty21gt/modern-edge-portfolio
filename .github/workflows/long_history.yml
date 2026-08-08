@@ -1,0 +1,35 @@
+name: Modern Edge Long History
+
+on:
+  workflow_dispatch:        # the "Run workflow" button
+  schedule:
+    - cron: '0 6 1 * *'     # also auto-runs on the 1st of each month
+
+permissions:
+  contents: write           # lets the job commit the output CSV back to the repo
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install "yfinance>=0.2.40" pandas numpy
+
+      - name: Build long-history monthly series
+        run: python pull_long_history.py
+
+      - name: Commit output
+        run: |
+          git config user.name  "github-actions"
+          git config user.email "actions@github.com"
+          git add data/modern_edge_long_history_monthly.csv data/modern_edge_long_history_proxymap.csv
+          git commit -m "Update long-history monthly series" || echo "no changes to commit"
+          git push

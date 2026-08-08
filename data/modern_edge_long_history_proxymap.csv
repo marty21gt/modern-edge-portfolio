@@ -5,7 +5,7 @@ VEA,VGTSX total-intl (1996; EM overlap),1996-05-31,364
 IEMG,VEIEX emerging (1994),1994-06-30,387
 IEF,VFITX int. Treasury (1991),1991-11-30,418
 SCHP,VIPSX / VFITX bridge pre-2000,1991-11-30,418
-SGOL,GC=F futures (2000) <- add gold_spot.csv for 1997,2000-09-30,312
+SGOL,spot gold (gold_spot.csv),1968-02-29,702
 BENCH_US,VFINX (S&P 500),1980-02-29,559
 BENCH_INTL,VGTSX total-intl (1996),1996-05-31,364
 BENCH_BOND,VBMFX total bond (1986),1987-01-31,476

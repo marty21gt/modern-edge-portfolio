@@ -1,169 +1,196 @@
 #!/usr/bin/env python3
-# =============================================================================
-# pull_long_history.py
-#
-# Pulls long-history proxy series for the Modern Edge (no-Bitcoin) sleeves and
-# the 60/40 benchmark, back through the 2008 crisis (and the dot-com tail where
-# data allows), so we can run an extended safe-withdrawal-rate bootstrap that
-# actually contains real bear markets.
-#
-# Output: modern_edge_long_history_monthly.csv  (monthly TOTAL returns, one
-#         column per sleeve/benchmark proxy) + a coverage log printed to screen.
-#
-# Run it, then send me the CSV back (same as you did with the price file).
-#
-#   pip install yfinance pandas numpy
-#   python pull_long_history.py
-#
-# NOTE ON MANAGED FUTURES (read this): there is no clean managed-futures ETF or
-# fund on Yahoo before ~2010, and managed futures is the exact sleeve that earns
-# its keep in 2008. To reach 2008 you need a trend/CTA index. Two options:
-#   (A) Download the SG Trend Index (free monthly data, SocGen Prime Services)
-#       or the BarclayHedge BTOP50, save it next to this script as
-#       'trend_index.csv' with two columns: date,value  (value = index level
-#       OR monthly return in decimal — the script auto-detects). If present, it
-#       is used and the backtest can span ~2000-present.
-#   (B) If that file is absent, the script falls back to WTMF (starts ~2011),
-#       which means the common window will start ~2011 and WON'T test 2008.
-# Everything here is proxy/backtested data with the usual limitations; the point
-# is to test the thesis through 2008, not to represent live performance.
-# =============================================================================
+"""
+Modern Edge - Long-History Monthly Builder
+==========================================
+Produces  data/modern_edge_long_history_monthly.csv : monthly TOTAL-RETURN series
+for each portfolio sleeve, using long-history proxies, back as far as the data
+allows (~2000, capped by TIPS/gold).
 
-import sys, os
+You never run this locally. GitHub Actions runs it on GitHub's servers, which have
+the internet access needed to reach Yahoo Finance. You just click "Run workflow".
+
+It reads  trend_index.csv  (BTOP50 managed-futures monthly returns) from the repo,
+because that one series is NOT available on Yahoo. Commit that file to the repo first.
+
+Output columns are named by the live ETF each sleeve uses today (VOO, QQQ, ...), so
+this monthly file lines up column-for-column with the daily components file. The real
+proxy instrument behind each column is written to
+data/modern_edge_long_history_proxymap.csv  for provenance / disclosures.
+"""
+
+import os, sys
 import numpy as np
 import pandas as pd
 
 try:
     import yfinance as yf
 except ImportError:
-    sys.exit("Please run:  pip install yfinance pandas numpy")
+    print("ERROR: yfinance not installed. The workflow installs it automatically.")
+    sys.exit(1)
 
-START = "1997-01-01"   # download from here; actual coverage is logged below
-
-# ---- Proxy map: logical sleeve -> ordered list of Yahoo tickers to try -------
-# Modern Edge (no-Bitcoin, retiree weights) and the 60/40 benchmark.
-# CAOS is intentionally proxied by T-bills for the whole long window (its live
-# AVOLX/CAOS history is already captured in the recent daily backtest).
-PROXIES = {
-    "US_LARGE":        ["VFINX", "SPY"],          # VOO  / 60-40 US equity  (S&P 500 TR)
-    "US_NASDAQ":       ["QQQ", "ONEQ"],           # QQQ  (Nasdaq-100, from 1999-03)
-    "DEV_INTL":        ["FSPSX", "EFA", "VTMGX"], # VEA  (MSCI EAFE)
-    "EM":              ["VEIEX", "VWO", "EEM"],   # IEMG (emerging markets)
-    "INT_TREASURY":    ["VFITX", "IEF"],          # IEF  (intermediate Treasury)
-    "TIPS":            ["VIPSX", "SCHP", "TIP"],  # SCHP (TIPS, from 2000-06)
-    "GOLD":            ["GC=F", "GLD", "IAU"],    # SGOL (gold)
-    "BENCH_INTL":      ["VGTSX", "VXUS"],         # VXUS (total international)
-    "BENCH_AGG":       ["VBMFX", "BND", "AGG"],   # BND  (US aggregate bond)
+# --- sleeve ETF  ->  ordered list of Yahoo proxy candidates (first with data wins) ---
+SLEEVE_PROXY = {
+    "VOO":  ["VFINX"],           # S&P 500 index fund (1976)
+    "QQQ":  ["QQQ"],             # Nasdaq-100 (1999) - catches the dot-com bust
+    "VEA":  ["FSPSX", "VGTSX"],  # Developed ex-US / EAFE (1997)
+    "IEMG": ["VEIEX"],           # Emerging markets (1994)
+    "IEF":  ["VFITX"],           # Intermediate-term Treasury (1991)
+    "SCHP": ["VIPSX"],           # TIPS (2000)  <-- usually the binding constraint
+    "SGOL": ["GC=F"],            # Gold futures (~2000)
 }
-MGD_FUTURES_FALLBACK = ["WTMF", "DBMF"]           # DBMF; only if trend_index.csv absent
-TRHEE_MO_TBILL       = "^IRX"                      # 13-week T-bill yield (SGOV + CAOS proxy)
+BENCH_PROXY = {
+    "BENCH_US":   ["VFINX"],     # 60/40 U.S. equity (1976)
+    "BENCH_INTL": ["VGTSX"],     # 60/40 international (1996)
+    "BENCH_BOND": ["VBMFX"],     # 60/40 total bond (1986)
+}
+TBILL_TICKER = "^IRX"            # 13-week T-bill yield (%) -> cash return for SGOV & CAOS sleeves
+TREND_CANDIDATES = ["trend_index.csv", "data/trend_index.csv"]  # BTOP50 -> DBMF sleeve
 
-# Weights are documented here for reference; portfolio construction happens on my end.
-ME_WEIGHTS = {"US_LARGE":.31,"US_NASDAQ":.12,"DEV_INTL":.06,"EM":.06,"TBILL":.10,
-              "INT_TREASURY":.10,"TIPS":.05,"MGD_FUTURES":.10,"GOLD":.05,"CAOS":.05}
-BENCH_WEIGHTS = {"US_LARGE":.40,"BENCH_INTL":.20,"BENCH_AGG":.40}
+RETIREE_SLEEVES = ["VOO","QQQ","VEA","IEMG","SGOV","IEF","SCHP","DBMF","SGOL","CAOS"]
+
+# retiree no-Bitcoin weights (BITB's 5% moved into VOO) and 60/40 weights, for the sanity check
+RETIREE_W = {"VOO":.31,"QQQ":.12,"VEA":.06,"IEMG":.06,"SGOV":.10,"IEF":.10,
+             "SCHP":.05,"DBMF":.10,"SGOL":.05,"CAOS":.05}
+BENCH_W   = {"BENCH_US":.40,"BENCH_INTL":.20,"BENCH_BOND":.40}
+FEE = 0.008
 
 
-def monthly_total_return(tickers):
-    """Try each ticker; return monthly total-return series from the first that works."""
-    for tk in tickers:
+def _close_series(df):
+    """Return a clean 1-D Close series from a yfinance frame (handles MultiIndex)."""
+    if df is None or len(df) == 0:
+        return None
+    px = df["Close"] if "Close" in df.columns else df.iloc[:, 0]
+    if isinstance(px, pd.DataFrame):
+        px = px.iloc[:, 0]
+    return px.dropna()
+
+
+def monthly_tr(candidates):
+    """Monthly total returns from month-end adjusted closes; first candidate with data wins."""
+    for t in candidates:
         try:
-            df = yf.download(tk, start=START, auto_adjust=True, progress=False)
-            if df is None or len(df) == 0:
+            df = yf.download(t, start="1975-01-01", auto_adjust=True,
+                             progress=False, threads=False)
+            px = _close_series(df)
+            if px is None or len(px) < 24:
                 continue
-            px = df["Close"]
-            if isinstance(px, pd.DataFrame):      # yfinance sometimes returns a frame
-                px = px.iloc[:, 0]
-            m = px.resample("ME").last().pct_change().dropna()
-            if len(m) > 12:
-                print(f"    {tk:8s} OK  {m.index.min().date()} -> {m.index.max().date()}  ({len(m)} mo)")
-                return m.rename(tk), tk
+            m = px.resample("ME").last()
+            r = m.pct_change().dropna()
+            if len(r) > 12:
+                r.name = None
+                return r, t
         except Exception as e:
-            print(f"    {tk:8s} failed: {e}")
+            print(f"    {t}: {e}")
     return None, None
 
 
 def tbill_monthly():
-    """Monthly T-bill total return from ^IRX (13-week discount yield, in percent)."""
-    df = yf.download(TRHEE_MO_TBILL, start=START, auto_adjust=True, progress=False)
-    y = df["Close"]
-    if isinstance(y, pd.DataFrame):
-        y = y.iloc[:, 0]
-    ym = y.resample("ME").last() / 100.0          # decimal annualized yield
-    r = (1 + ym.shift(1)) ** (1/12) - 1            # use prior month-end yield
-    r = r.dropna()
-    print(f"    {TRHEE_MO_TBILL:8s} OK  {r.index.min().date()} -> {r.index.max().date()}  ({len(r)} mo)  [T-bill; used for SGOV and CAOS]")
-    return r.rename("TBILL")
+    try:
+        df = yf.download(TBILL_TICKER, start="1975-01-01", auto_adjust=True,
+                         progress=False, threads=False)
+        y = _close_series(df)
+        if y is None:
+            return None
+        y = y.resample("ME").last()          # annualized yield, in percent
+        r = (y.shift(1) / 100.0) / 12.0        # earn prior month's yield over the month
+        return r.dropna()
+    except Exception as e:
+        print("  T-bill error:", e)
+        return None
 
 
-def trend_index_monthly():
-    """Use trend_index.csv (SG Trend / BTOP50) if present; else fall back to a fund."""
-    path = "trend_index.csv"
-    if os.path.exists(path):
-        raw = pd.read_csv(path)
-        raw.columns = [c.strip().lower() for c in raw.columns]
-        raw["date"] = pd.to_datetime(raw["date"])
-        raw = raw.set_index("date").sort_index()
-        val = raw["value"].astype(float)
-        # auto-detect: index levels (values >> 1) vs monthly returns (small around 0)
-        if val.abs().median() > 1.5:
-            r = val.resample("ME").last().pct_change().dropna()
-            kind = "index levels"
-        else:
-            r = val.resample("ME").last().dropna()
-            kind = "monthly returns"
-        print(f"    trend_index.csv OK  ({kind})  {r.index.min().date()} -> {r.index.max().date()}  ({len(r)} mo)  [DBMF proxy]")
-        return r.rename("MGD_FUTURES")
-    print("    trend_index.csv NOT found -> falling back to a fund proxy.")
-    print("    *** WARNING: without a trend index this will NOT reach 2008. ***")
-    m, tk = monthly_total_return(MGD_FUTURES_FALLBACK)
-    return m.rename("MGD_FUTURES") if m is not None else None
+def trend_monthly():
+    path = next((p for p in TREND_CANDIDATES if os.path.exists(p)), None)
+    if path is None:
+        print("  !! trend_index.csv not found in repo root or data/ — DBMF sleeve will be missing.")
+        return None
+    td = pd.read_csv(path)
+    dcol = "date" if "date" in td.columns else td.columns[0]
+    vcol = "value" if "value" in td.columns else td.columns[1]
+    td[dcol] = pd.to_datetime(td[dcol])
+    s = td.set_index(dcol)[vcol].astype(float)     # already monthly RETURNS (decimal)
+    s.index = s.index + pd.offsets.MonthEnd(0)     # snap to month-end
+    return s.sort_index()
+
+
+def port_stats(returns, weights, fee=0.0, label=""):
+    have = [c for c in weights if c in returns.columns]
+    if len(have) < len(weights):
+        return None
+    w = pd.Series({k: weights[k] for k in have})
+    w = w / w.sum()
+    sub = returns[have].dropna()
+    pr = sub.mul(w, axis=1).sum(axis=1)            # monthly rebalanced
+    if fee:
+        pr = (1 + pr) * ((1 - fee) ** (1/12)) - 1
+    n = len(pr)
+    cum = (1 + pr).cumprod()
+    cagr = cum.iloc[-1] ** (12/n) - 1
+    vol = pr.std() * np.sqrt(12)
+    dd = (cum / cum.cummax() - 1).min()
+    print(f"   {label:28s} {cagr*100:5.2f}% CAGR / {vol*100:5.2f}% vol / {dd*100:6.2f}% maxDD"
+          f"   [{sub.index.min().date()}→{sub.index.max().date()}]")
 
 
 def main():
-    print("Downloading long-history proxies (monthly total returns)...\n")
-    cols = {}
+    os.makedirs("data", exist_ok=True)
+    cols, prov = {}, []
+    print("Downloading long-history proxies (monthly total returns)...")
 
-    for sleeve, tickers in PROXIES.items():
-        print(f"  {sleeve}:")
-        s, used = monthly_total_return(tickers)
-        if s is None:
-            print(f"    !! no data for {sleeve} — check tickers")
-        else:
-            cols[sleeve] = s
+    for etf, cands in {**SLEEVE_PROXY, **BENCH_PROXY}.items():
+        r, used = monthly_tr(cands)
+        if r is None:
+            print(f"  {etf:10s} NO DATA (tried {cands})")
+            continue
+        cols[etf] = r
+        prov.append({"column": etf, "proxy": used,
+                     "start": str(r.index.min().date()), "obs": int(len(r))})
+        print(f"  {etf:10s} <- {used:7s}  from {r.index.min().date()}  ({len(r)} mo)")
 
-    print("  TBILL (SGOV + CAOS proxy):")
-    cols["TBILL"] = tbill_monthly()
+    tb = tbill_monthly()
+    if tb is not None:
+        cols["SGOV"] = tb
+        cols["CAOS"] = tb.copy()
+        for etf in ("SGOV", "CAOS"):
+            prov.append({"column": etf, "proxy": "^IRX T-bill",
+                         "start": str(tb.index.min().date()), "obs": int(len(tb))})
+        print(f"  SGOV/CAOS  <- ^IRX     from {tb.index.min().date()}  ({len(tb)} mo)")
 
-    print("  MGD_FUTURES (DBMF proxy):")
-    mf = trend_index_monthly()
+    mf = trend_monthly()
     if mf is not None:
-        cols["MGD_FUTURES"] = mf
+        cols["DBMF"] = mf
+        prov.append({"column": "DBMF", "proxy": "BTOP50 (trend_index.csv)",
+                     "start": str(mf.index.min().date()), "obs": int(len(mf))})
+        print(f"  DBMF       <- BTOP50  from {mf.index.min().date()}  ({len(mf)} mo)")
 
-    # CAOS = T-bills for the entire long window (per instruction)
-    cols["CAOS"] = cols["TBILL"].rename("CAOS")
-
-    data = pd.concat(cols.values(), axis=1)
+    data = pd.concat(cols, axis=1).sort_index()
     data.index.name = "date"
 
-    # Report common-history window (all Modern Edge sleeves present)
-    me_cols = [c for c in ME_WEIGHTS if c in data.columns]
-    common = data[me_cols].dropna()
+    have = [c for c in RETIREE_SLEEVES if c in data.columns]
+    common = data[have].dropna()
     print("\n" + "=" * 66)
     if len(common):
-        print(f"Common history where ALL Modern Edge sleeves exist:")
+        starts = {c: data[c].dropna().index.min() for c in have}
+        binder = max(starts, key=starts.get)
+        print("Common history where ALL retiree sleeves exist:")
         print(f"   {common.index.min().date()}  ->  {common.index.max().date()}   ({len(common)} months)")
-        covers_2008 = common.index.min() <= pd.Timestamp("2007-10-01")
-        print(f"   Covers the 2008 crisis: {'YES' if covers_2008 else 'NO  (need trend_index.csv)'}")
+        print(f"   Covers 2008 GFC : {'YES' if common.index.min() <= pd.Timestamp('2007-10-31') else 'NO'}")
+        print(f"   Covers dot-com  : {'YES' if common.index.min() <= pd.Timestamp('2000-09-30') else 'PARTIAL / NO'}")
+        print(f"   Binding sleeve  : {binder}  (starts {starts[binder].date()})")
+        print("\n   Sanity check (monthly-rebalanced, common window):")
+        port_stats(common, RETIREE_W, fee=FEE, label="Retiree no-BTC (net 0.8%)")
+        port_stats(data[[c for c in BENCH_W if c in data.columns]].dropna(), BENCH_W, 0.0,   "60/40 (gross)")
+        port_stats(data[[c for c in BENCH_W if c in data.columns]].dropna(), BENCH_W, FEE, "60/40 (net 0.8%)")
     else:
-        print("No common window — a sleeve is missing. See warnings above.")
+        print("No common window — a sleeve is missing. See messages above.")
     print("=" * 66)
 
-    out = "modern_edge_long_history_monthly.csv"
+    out = "data/modern_edge_long_history_monthly.csv"
     data.to_csv(out, float_format="%.6f")
-    print(f"\nSaved {out}  ({data.shape[0]} rows x {data.shape[1]} columns)")
-    print("Columns:", ", ".join(data.columns))
-    print("\nSend this CSV back and I'll run the extended safe-withdrawal bootstrap.")
+    pd.DataFrame(prov).to_csv("data/modern_edge_long_history_proxymap.csv", index=False)
+    print(f"\nSaved {out}  ({data.shape[0]} rows x {data.shape[1]} cols)")
+    print("Saved data/modern_edge_long_history_proxymap.csv")
+    print("\nDownload the monthly CSV from the data/ folder and attach it back in chat.")
 
 
 if __name__ == "__main__":
